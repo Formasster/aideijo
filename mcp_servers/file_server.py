@@ -9,60 +9,51 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.settings import RUTA_HOME, RUTA_PROYECTO
 
 class FileMCPServer:
-    """Servidor MCP que actúa como los ojos y manos de Aideijo en el sistema de archivos."""
+    """MCP Server acting as the secure file system interface for Aideijo."""
     
     def __init__(self):
-        # Definimos zonas seguras para evitar que el agente borre archivos del sistema por error
-        self.zonas_permitidas = {
-            "proyecto": RUTA_PROYECTO,
+        # Define secure zones to prevent accidental out-of-bounds operations
+        self.allowed_zones = {
+            "project": RUTA_PROYECTO,
             "home": RUTA_HOME
         }
 
-    def _validar_ruta(self, ruta: str) -> Path:
-        """Convierte a ruta absoluta y valida que sea segura."""
-        ruta_p = Path(ruta).resolve()
-        # Por seguridad, verificamos si está dentro de las zonas permitidas
-        dentro_de_zona = any(ruta_p.is_relative_to(zona) for zona in self.zonas_permitidas.values())
-        if not dentro_de_zona:
-            raise PermissionError(f"❌ Acceso denegado. La ruta {ruta} está fuera del entorno seguro.")
-        return ruta_p
+    def _validate_path(self, target_path: str) -> Path:
+        """Resolves to an absolute path and verifies it is inside allowed secure zones."""
+        resolved_path = Path(target_path).resolve()
+        is_safe = any(resolved_path.is_relative_to(zone) for zone in self.allowed_zones.values())
+        if not is_safe:
+            raise PermissionError(f"Access denied. Path {target_path} is outside secure boundaries.")
+        return resolved_path
 
-    def list_directory(self, ruta: str = "."):
-        """Herramienta: Lista los archivos y carpetas de un directorio."""
+    def list_directory(self, dir_path: str = "."):
+        """Lists files and directories inside a specific path."""
         try:
-            # Si es una ruta relativa, la tomamos desde la raíz del proyecto
-            ruta_objetivo = Path(ruta) if Path(ruta).is_absolute() else RUTA_PROYECTO / ruta
-            ruta_validada = self._validar_ruta(str(ruta_objetivo))
-            
-            elementos = os.listdir(ruta_validada)
-            print(f"📁 [Aideijo - MCP] Listando contenido de: {ruta_validada}")
-            return {"status": "success", "data": elementos}
+            target = Path(dir_path) if Path(dir_path).is_absolute() else RUTA_PROYECTO / dir_path
+            validated_path = self._validate_path(str(target))
+            elements = os.listdir(validated_path)
+            return {"status": "success", "data": elements}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def read_file(self, ruta_archivo: str):
-        """Herramienta: Lee el contenido de un archivo de texto (Código, Markdown, etc)."""
+    def read_file(self, file_path: str):
+        """Reads the text content of a file."""
         try:
-            ruta_objetivo = Path(ruta_archivo) if Path(ruta_archivo).is_absolute() else RUTA_PROYECTO / ruta_archivo
-            ruta_validada = self._validar_ruta(str(ruta_objetivo))
-            
-            contenido = ruta_validada.read_text(encoding="utf-8")
-            print(f"📖 [Aideijo - MCP] Leyendo archivo: {ruta_validada.name}")
-            return {"status": "success", "content": contenido}
+            target = Path(file_path) if Path(file_path).is_absolute() else RUTA_PROYECTO / file_path
+            validated_path = self._validate_path(str(target))
+            content = validated_path.read_text(encoding="utf-8")
+            return {"status": "success", "content": content}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def write_file(self, ruta_archivo: str, contenido: str):
-        """Herramienta: Crea o sobreescribe un archivo con nuevo contenido."""
+    def write_file(self, file_path: str, content: str):
+        """Creates or overwrites a file with new content."""
         try:
-            ruta_objetivo = Path(ruta_archivo) if Path(ruta_archivo).is_absolute() else RUTA_PROYECTO / ruta_archivo
-            ruta_validada = self._validar_ruta(str(ruta_objetivo))
-            
-            # Asegurar que las carpetas intermedias existan
-            ruta_validada.parent.mkdir(parents=True, exist_ok=True)
-            ruta_validada.write_text(contenido, encoding="utf-8")
-            print(f"💾 [Aideijo - MCP] Archivo guardado con éxito: {ruta_validada.name}")
-            return {"status": "success", "message": f"Archivo {ruta_validada.name} guardado."}
+            target = Path(file_path) if Path(file_path).is_absolute() else RUTA_PROYECTO / file_path
+            validated_path = self._validate_path(str(target))
+            validated_path.parent.mkdir(parents=True, exist_ok=True)
+            validated_path.write_text(content, encoding="utf-8")
+            return {"status": "success", "message": f"File {validated_path.name} saved successfully."}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -71,22 +62,19 @@ mcp = FastMCP("Aideijo File Server")
 server = FileMCPServer()
 
 @mcp.tool()
-def list_directory(ruta: str = ".") -> str:
-    """Lista los archivos y carpetas de un directorio."""
-    res = server.list_directory(ruta)
-    return str(res)
+def list_directory(dir_path: str = ".") -> str:
+    """List files and folders inside a directory path."""
+    return str(server.list_directory(dir_path))
 
 @mcp.tool()
-def read_file(ruta_archivo: str) -> str:
-    """Lee el contenido de un archivo de texto (Código, Markdown, etc)."""
-    res = server.read_file(ruta_archivo)
-    return str(res)
+def read_file(file_path: str) -> str:
+    """Read the full text content of a file."""
+    return str(server.read_file(file_path))
 
 @mcp.tool()
-def write_file(ruta_archivo: str, contenido: str) -> str:
-    """Crea o sobreescribe un archivo con nuevo contenido."""
-    res = server.write_file(ruta_archivo, contenido)
-    return str(res)
+def write_file(file_path: str, content: str) -> str:
+    """Create or overwrite a file with specific content."""
+    return str(server.write_file(file_path, content))
 
 if __name__ == "__main__":
     mcp.run()

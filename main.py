@@ -58,12 +58,12 @@ async def run_interactive_chat():
         await agent.stop_mcp_servers()
 
 def run_file_server():
-    console.print("[bold cyan]Starting File MCP Server...[/bold cyan]")
+    print("Starting File MCP Server...", file=sys.stderr, flush=True)
     from mcp_servers.file_server import mcp
     mcp.run()
 
 def run_terminal_server():
-    console.print("[bold cyan]Starting Terminal MCP Server...[/bold cyan]")
+    print("Starting Terminal MCP Server...", file=sys.stderr, flush=True)
     from mcp_servers.terminal_server import mcp
     mcp.run()
 
