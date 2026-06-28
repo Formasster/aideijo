@@ -244,6 +244,23 @@ class OrchestratorAgent:
         else:
             return self._chat_mock(user_message)
 
+    async def _gemini_generate_with_retry(self, config, max_retries: int = 5):
+        """Call Gemini, retrying transient errors (503/429/overloaded) with exponential backoff."""
+        delay = 2.0
+        for attempt in range(max_retries):
+            try:
+                return self.client.models.generate_content(
+                    model=self.model_name, contents=self.gemini_history, config=config
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                transient = any(s in msg for s in ["503", "429", "unavailable", "overloaded", "high demand", "resource_exhausted"])
+                if not transient or attempt == max_retries - 1:
+                    raise
+                print(f"[Orchestrator] Gemini transient error (attempt {attempt + 1}/{max_retries}), retrying in {delay:.0f}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+
     async def _chat_gemini(self, user_message: str) -> str:
         from google.genai import types
 
@@ -267,7 +284,7 @@ class OrchestratorAgent:
         try:
             loop_count = 0
             while loop_count < 10:
-                response = self.client.models.generate_content(model=self.model_name, contents=self.gemini_history, config=config)
+                response = await self._gemini_generate_with_retry(config)
                 
                 if response.candidates and response.candidates[0].content:
                     self.gemini_history.append(response.candidates[0].content)
