@@ -12,6 +12,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import settings
 from agents.coder import CoderAgent
 
+class ProviderUnavailable(Exception):
+    """Raised when an LLM provider is temporarily unavailable, signalling the orchestrator to fall back."""
+    pass
+
 class OrchestratorAgent:
     def __init__(self):
         self.coder = CoderAgent()
@@ -79,6 +83,7 @@ class OrchestratorAgent:
         
         self.gemini_history = []
         self.openai_history = [{"role": "system", "content": self.system_instruction}]
+        self.anthropic_history = []
         
         self.file_session: Optional[ClientSession] = None
         self.terminal_session: Optional[ClientSession] = None
@@ -124,25 +129,40 @@ class OrchestratorAgent:
             self.notion_path.write_text(default_notion, encoding="utf-8")
 
     def _init_llm_client(self):
+        """Initializes every provider that has a valid key, in fallback priority order."""
+        self.providers = []
+        self.gemini_client = None
+        self.openai_client = None
+        self.anthropic_client = None
+        self.gemini_model = "gemini-2.5-flash"
+        self.openai_model = "gpt-4o"
+        self.anthropic_model = "claude-sonnet-4-6"
+
         if settings.GEMINI_API_KEY:
             try:
                 from google import genai
-                self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-                self.client_type = "gemini"
-                self.model_name = "gemini-2.5-flash"
+                self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                self.providers.append("gemini")
             except Exception as e:
                 print(f"Orchestrator Gemini Init Error: {e}")
-        if not self.client and settings.OPENAI_API_KEY:
+
+        if settings.OPENAI_API_KEY:
             try:
                 from openai import OpenAI
-                self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-                self.client_type = "openai"
-                self.model_name = "gpt-4o"
+                self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                self.providers.append("openai")
             except Exception as e:
                 print(f"Orchestrator OpenAI Init Error: {e}")
-        if not self.client:
-            self.client_type = "mock"
-            self.model_name = "mock-model"
+
+        if settings.ANTHROPIC_API_KEY:
+            try:
+                import anthropic
+                self.anthropic_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                self.providers.append("anthropic")
+            except Exception as e:
+                print(f"Orchestrator Anthropic Init Error: {e}")
+
+        self.client_type = self.providers[0] if self.providers else "mock"
 
     async def start_mcp_servers(self):
         print("[Orchestrator] Starting MCP Servers via Main CLI...")
@@ -237,26 +257,45 @@ class OrchestratorAgent:
         return result
 
     async def chat(self, user_message: str) -> str:
-        if self.client_type == "gemini":
-            return await self._chat_gemini(user_message)
-        elif self.client_type == "openai":
-            return await self._chat_openai(user_message)
-        else:
+        if not self.providers:
             return self._chat_mock(user_message)
 
+        handlers = {
+            "gemini": self._chat_gemini,
+            "openai": self._chat_openai,
+            "anthropic": self._chat_anthropic,
+        }
+        errors = []
+        for index, provider in enumerate(self.providers):
+            try:
+                return await handlers[provider](user_message)
+            except Exception as e:
+                errors.append(f"{provider}: {e}")
+                nxt = self.providers[index + 1] if index + 1 < len(self.providers) else None
+                if nxt:
+                    print(f"[Orchestrator] Provider '{provider}' unavailable; falling back to '{nxt}'...")
+                else:
+                    print(f"[Orchestrator] Provider '{provider}' unavailable and no fallback left.")
+        return "Error: все провайдеры LLM недоступны (all LLM providers failed).\n" + "\n".join(errors)
+
     async def _gemini_generate_with_retry(self, config, max_retries: int = 5):
-        """Call Gemini, retrying transient errors (503/429/overloaded) with exponential backoff."""
+        """Call Gemini, retrying transient errors (503/429/overloaded) with exponential backoff.
+
+        Raises ProviderUnavailable once retries are exhausted so the orchestrator can fall back.
+        """
         delay = 2.0
         for attempt in range(max_retries):
             try:
-                return self.client.models.generate_content(
-                    model=self.model_name, contents=self.gemini_history, config=config
+                return self.gemini_client.models.generate_content(
+                    model=self.gemini_model, contents=self.gemini_history, config=config
                 )
             except Exception as e:
                 msg = str(e).lower()
                 transient = any(s in msg for s in ["503", "429", "unavailable", "overloaded", "high demand", "resource_exhausted"])
-                if not transient or attempt == max_retries - 1:
+                if not transient:
                     raise
+                if attempt == max_retries - 1:
+                    raise ProviderUnavailable(str(e))
                 print(f"[Orchestrator] Gemini transient error (attempt {attempt + 1}/{max_retries}), retrying in {delay:.0f}s...")
                 await asyncio.sleep(delay)
                 delay *= 2
@@ -280,40 +319,37 @@ class OrchestratorAgent:
         )
 
         self.gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
-        
-        try:
-            loop_count = 0
-            while loop_count < 10:
-                response = await self._gemini_generate_with_retry(config)
-                
-                if response.candidates and response.candidates[0].content:
-                    self.gemini_history.append(response.candidates[0].content)
-                
-                if not response.function_calls:
-                    return response.text or "No response from Gemini."
-                
-                tool_parts = []
-                for call in response.function_calls:
-                    name = call.name
-                    args = call.args
-                    print(f"[Orchestrator Gemini Loop] Executing tool: {name}")
-                    
-                    if name == "read_file": result = await self.tool_read_file(args.get("file_path"))
-                    elif name == "write_file": result = await self.tool_write_file(args.get("file_path"), args.get("content"))
-                    elif name == "list_directory": result = await self.tool_list_directory(args.get("dir_path", "."))
-                    elif name == "run_command": result = await self.tool_run_command(args.get("command"))
-                    elif name == "launch_workspace": result = await self.tool_launch_workspace(args.get("workspace_type"))
-                    elif name == "delegate_to_coder": result = self.tool_delegate_to_coder(args.get("prompt"))
-                    else: result = f"Unknown tool: {name}"
-                    
-                    tool_parts.append(types.Part.from_function_response(name=name, response={"result": str(result)}))
-                
-                self.gemini_history.append(types.Content(role="tool", parts=tool_parts))
-                loop_count += 1
-                
-            return "Error: Maximum agent loop iterations exceeded."
-        except Exception as e:
-            return f"Error in Orchestrator Gemini Chat: {str(e)}"
+
+        loop_count = 0
+        while loop_count < 10:
+            response = await self._gemini_generate_with_retry(config)
+
+            if response.candidates and response.candidates[0].content:
+                self.gemini_history.append(response.candidates[0].content)
+
+            if not response.function_calls:
+                return response.text or "No response from Gemini."
+
+            tool_parts = []
+            for call in response.function_calls:
+                name = call.name
+                args = call.args
+                print(f"[Orchestrator Gemini Loop] Executing tool: {name}")
+
+                if name == "read_file": result = await self.tool_read_file(args.get("file_path"))
+                elif name == "write_file": result = await self.tool_write_file(args.get("file_path"), args.get("content"))
+                elif name == "list_directory": result = await self.tool_list_directory(args.get("dir_path", "."))
+                elif name == "run_command": result = await self.tool_run_command(args.get("command"))
+                elif name == "launch_workspace": result = await self.tool_launch_workspace(args.get("workspace_type"))
+                elif name == "delegate_to_coder": result = self.tool_delegate_to_coder(args.get("prompt"))
+                else: result = f"Unknown tool: {name}"
+
+                tool_parts.append(types.Part.from_function_response(name=name, response={"result": str(result)}))
+
+            self.gemini_history.append(types.Content(role="tool", parts=tool_parts))
+            loop_count += 1
+
+        return "Error: Maximum agent loop iterations exceeded."
 
     async def _chat_openai(self, user_message: str) -> str:
         tools_schema = [
@@ -326,35 +362,80 @@ class OrchestratorAgent:
         ]
         
         self.openai_history.append({"role": "user", "content": user_message})
-        
-        try:
-            loop_count = 0
-            while loop_count < 10:
-                response = self.client.chat.completions.create(model=self.model_name, messages=self.openai_history, tools=tools_schema, tool_choice="auto")
-                response_message = response.choices[0].message
-                self.openai_history.append(response_message)
-                
-                if not response_message.tool_calls:
-                    return response_message.content or "No response from model."
-                    
-                for tool_call in response_message.tool_calls:
-                    name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
-                    print(f"[Orchestrator OpenAI Loop] Executing tool: {name}")
-                    
-                    if name == "read_file": result = await self.tool_read_file(args.get("file_path"))
-                    elif name == "write_file": result = await self.tool_write_file(args.get("file_path"), args.get("content"))
-                    elif name == "list_directory": result = await self.tool_list_directory(args.get("dir_path", "."))
-                    elif name == "run_command": result = await self.tool_run_command(args.get("command"))
-                    elif name == "launch_workspace": result = await self.tool_launch_workspace(args.get("workspace_type"))
-                    elif name == "delegate_to_coder": result = self.tool_delegate_to_coder(args.get("prompt"))
-                    else: result = f"Unknown tool: {name}"
-                    
-                    self.openai_history.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": str(result)})
-                loop_count += 1
-            return "Error: Maximum agent loop iterations exceeded."
-        except Exception as e:
-            return f"Error in Orchestrator OpenAI Chat: {str(e)}"
+
+        loop_count = 0
+        while loop_count < 10:
+            response = self.openai_client.chat.completions.create(model=self.openai_model, messages=self.openai_history, tools=tools_schema, tool_choice="auto")
+            response_message = response.choices[0].message
+            self.openai_history.append(response_message)
+
+            if not response_message.tool_calls:
+                return response_message.content or "No response from model."
+
+            for tool_call in response_message.tool_calls:
+                name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+                print(f"[Orchestrator OpenAI Loop] Executing tool: {name}")
+
+                if name == "read_file": result = await self.tool_read_file(args.get("file_path"))
+                elif name == "write_file": result = await self.tool_write_file(args.get("file_path"), args.get("content"))
+                elif name == "list_directory": result = await self.tool_list_directory(args.get("dir_path", "."))
+                elif name == "run_command": result = await self.tool_run_command(args.get("command"))
+                elif name == "launch_workspace": result = await self.tool_launch_workspace(args.get("workspace_type"))
+                elif name == "delegate_to_coder": result = self.tool_delegate_to_coder(args.get("prompt"))
+                else: result = f"Unknown tool: {name}"
+
+                self.openai_history.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": str(result)})
+            loop_count += 1
+        return "Error: Maximum agent loop iterations exceeded."
+
+    async def _chat_anthropic(self, user_message: str) -> str:
+        tools_schema = [
+            {"name": "read_file", "description": "Read the contents of a file.", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}},
+            {"name": "write_file", "description": "Write or overwrite content in a file.", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]}},
+            {"name": "list_directory", "description": "List files and folders in a path.", "input_schema": {"type": "object", "properties": {"dir_path": {"type": "string"}}}},
+            {"name": "run_command", "description": "Execute a terminal shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+            {"name": "launch_workspace", "description": "Launch a specific system workspace layout ('work' maps to Desktop, 'personal' maps to project workspace folder).", "input_schema": {"type": "object", "properties": {"workspace_type": {"type": "string"}}, "required": ["workspace_type"]}},
+            {"name": "delegate_to_coder", "description": "Delegate a coding task to the coder assistant.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}
+        ]
+
+        self.anthropic_history.append({"role": "user", "content": user_message})
+
+        loop_count = 0
+        while loop_count < 10:
+            response = self.anthropic_client.messages.create(
+                model=self.anthropic_model,
+                max_tokens=4096,
+                system=self.system_instruction,
+                messages=self.anthropic_history,
+                tools=tools_schema,
+            )
+            self.anthropic_history.append({"role": "assistant", "content": response.content})
+
+            tool_uses = [block for block in response.content if block.type == "tool_use"]
+            if not tool_uses:
+                texts = [block.text for block in response.content if block.type == "text"]
+                return "\n".join(texts) or "No response from Claude."
+
+            tool_results = []
+            for tool_use in tool_uses:
+                name = tool_use.name
+                args = tool_use.input or {}
+                print(f"[Orchestrator Anthropic Loop] Executing tool: {name}")
+
+                if name == "read_file": result = await self.tool_read_file(args.get("file_path"))
+                elif name == "write_file": result = await self.tool_write_file(args.get("file_path"), args.get("content"))
+                elif name == "list_directory": result = await self.tool_list_directory(args.get("dir_path", "."))
+                elif name == "run_command": result = await self.tool_run_command(args.get("command"))
+                elif name == "launch_workspace": result = await self.tool_launch_workspace(args.get("workspace_type"))
+                elif name == "delegate_to_coder": result = self.tool_delegate_to_coder(args.get("prompt"))
+                else: result = f"Unknown tool: {name}"
+
+                tool_results.append({"type": "tool_result", "tool_use_id": tool_use.id, "content": str(result)})
+
+            self.anthropic_history.append({"role": "user", "content": tool_results})
+            loop_count += 1
+        return "Error: Maximum agent loop iterations exceeded."
 
     def _chat_mock(self, user_message: str) -> str:
         return f"--- DRY RUN (MOCK) ---\nRequest: {user_message}"

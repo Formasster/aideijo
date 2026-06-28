@@ -27,8 +27,19 @@ else:
     print("⚠️ [Aideijo] Alerta: No se encontró el archivo .env local.")
 
 # 4. VARIABLES DE CONFIGURACIÓN
+def _clean_key(value):
+    """Trata las claves vacías o con el valor de ejemplo ('..._here') como ausentes."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.endswith("_here"):
+        return None
+    return value
+
 ENTORNO = os.getenv("ENTORNO", "DESCONOCIDO")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = _clean_key(os.getenv("GEMINI_API_KEY"))
+OPENAI_API_KEY = _clean_key(os.getenv("OPENAI_API_KEY"))
+ANTHROPIC_API_KEY = _clean_key(os.getenv("ANTHROPIC_API_KEY"))
 USE_OLLAMA = os.getenv("USE_OLLAMA", "False").lower() in ("true", "1", "t")
 
 # 5. CONFIGURACIÓN DE HERRAMIENTAS SEGÚN EL ENTORNO
