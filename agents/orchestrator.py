@@ -213,12 +213,43 @@ class OrchestratorAgent:
             return response.content[0].text if response.content else "[]"
         return "Error: File server not connected."
 
+    @staticmethod
+    def _ask_yes_no(question: str) -> bool:
+        """Ask a yes/no question accepting affirmative/negative answers in many languages."""
+        from rich.console import Console
+        from rich.prompt import Prompt
+
+        console = Console()
+        affirmatives = {
+            "y", "yes", "yeah", "yep", "ok", "okay",          # English
+            "s", "si", "sí", "sip", "vale", "claro", "dale",  # Spanish
+            "d", "da", "да", "ага", "конечно",                # Russian
+            "o", "oui", "ouais",                              # French
+            "j", "ja", "jou",                                 # German / Dutch
+            "sim",                                            # Portuguese
+            "true", "1",
+        }
+        negatives = {
+            "n", "no", "nope", "nah",                         # English / Spanish
+            "нет", "не", "ни",                                # Russian
+            "non",                                            # French
+            "nein", "nee",                                    # German / Dutch
+            "nao", "não",                                     # Portuguese
+            "false", "0",
+        }
+        while True:
+            answer = Prompt.ask(question).strip().lower()
+            if answer in affirmatives:
+                return True
+            if answer in negatives:
+                return False
+            console.print("[dim yellow]Не понял. Ответьте да/нет (sí/no, yes/no...).[/dim yellow]")
+
     async def tool_run_command(self, command: str) -> str:
         if self.terminal_session:
             from rich.console import Console
-            from rich.prompt import Confirm
             from rich.panel import Panel
-            
+
             console = Console()
             console.print(Panel(
                 f"[bold yellow]⚠️ ADVERTENCIA DE SEGURIDAD / SECURITY WARNING[/bold yellow]\n"
@@ -226,8 +257,8 @@ class OrchestratorAgent:
                 f"   [bold white]👉 {command}[/bold white]",
                 border_style="yellow"
             ))
-            
-            autorizado = Confirm.ask("[bold cyan]¿Autorizas la ejecución en tu sistema?[/bold cyan]")
+
+            autorizado = self._ask_yes_no("[bold cyan]¿Autorizas la ejecución? (sí/no · yes/no · да/нет)[/bold cyan]")
             if not autorizado:
                 return "Error: Execution denied by the operator."
                 
